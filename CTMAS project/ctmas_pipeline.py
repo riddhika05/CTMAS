@@ -12,12 +12,14 @@ Pipeline Steps:
   6. Explainability   -> SHAP TreeExplainer (global + local)
   7. Threat Reasoning -> human-readable attack explanations
   8. Output Files     -> predictions.csv, shap_summary.csv, shap_local_explanations.csv
+  9. Attack Clustering -> KMeans on SHAP vectors, PCA viz, auto-labelling
 """
 
 import os
 import sys
 import warnings
 import logging
+from collections import Counter
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -690,83 +692,244 @@ def compute_agreement(shap_local_df: pd.DataFrame, lime_local_df: pd.DataFrame):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 12 – Attack Clustering (KMeans + PCA)
+# STEP 10 – Attack Clustering (KMeans on SHAP vectors + PCA)
 # ──────────────────────────────────────────────────────────────────────────────
-def cluster_attacks(X_test: pd.DataFrame, predictions_df: pd.DataFrame):
+def run_attack_clustering(
+    X_test:         pd.DataFrame,
+    y_test:         pd.Series,
+    shap_values:    np.ndarray,
+    feature_names:  list,
+    predictions_df: pd.DataFrame,
+    shap_local_df:  pd.DataFrame,
+):
+    """
+    Step 10 — Attack Clustering.
+
+    Clusters predicted-attack instances using their SHAP explanation vectors,
+    then cross-references statistical feature deviations with SHAP-derived
+    feature importance per cluster to auto-generate human-readable labels.
+
+    Returns
+    -------
+    cluster_df : pd.DataFrame
+        X_attacks with an added ``cluster`` column.
+    cluster_labels_map : dict
+        {cluster_id: auto-generated string label}
+    """
     log.info("=" * 70)
-    log.info("STEP 12 – ATTACK CLUSTERING (KMeans + PCA)")
+    log.info("[STEP 10] ATTACK CLUSTERING (KMeans on SHAP + PCA)")
     log.info("=" * 70)
 
-    attack_mask = predictions_df["predicted"] == 1
-    X_attacks = X_test.loc[attack_mask[attack_mask].index]
-    log.info(f"  Attack instances for clustering: {len(X_attacks):,}")
+    # ── Step A — Isolate attack rows ─────────────────────────────────────────
+    log.info("[STEP 10] Step A — Isolating predicted-attack rows …")
+
+    # Align predictions_df to X_test index (they share the same index)
+    attack_mask = predictions_df.loc[X_test.index, "predicted"] == 1
+    attack_indices = attack_mask[attack_mask].index
+    X_attacks = X_test.loc[attack_indices].copy()
+
+    # Map each attack index to its *positional* location in X_test so we can
+    # slice into the shap_values numpy array (which is positionally aligned
+    # with X_test — or X_shap if it was truncated).
+    # shap_values may cover only the first MAX_SHAP_ROWS of X_test, so we
+    # must restrict to rows that actually have SHAP values.
+    max_shap_rows = shap_values.shape[0]
+    pos_in_xtest = np.array([X_test.index.get_loc(idx) for idx in attack_indices])
+    valid = pos_in_xtest < max_shap_rows
+    attack_indices = attack_indices[valid]
+    pos_in_xtest   = pos_in_xtest[valid]
+    X_attacks = X_test.loc[attack_indices].copy()
+    shap_attacks = shap_values[pos_in_xtest]
+
+    log.info(f"[STEP 10]   Predicted attacks in test set : {int(attack_mask.sum()):,}")
+    log.info(f"[STEP 10]   Attacks with SHAP coverage    : {len(X_attacks):,}")
 
     if len(X_attacks) < 10:
-        log.warning("  Too few attack instances for clustering. Skipping.")
-        return None
+        log.warning("[STEP 10]   Too few attack instances for clustering. Skipping.")
+        return None, {}
 
-    # Standardize
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_attacks)
+    # ── Step B — K-Means on SHAP vectors with silhouette selection ───────────
+    log.info("[STEP 10] Step B — KMeans clustering on SHAP vectors …")
 
-    # Find best n_clusters via silhouette score
-    best_k, best_score = 4, -1
-    for k in [3, 4, 5, 6]:
+    candidate_ks = [3, 4, 5, 6]
+    best_k, best_score = candidate_ks[0], -1.0
+    sil_sample = min(5000, len(shap_attacks))
+
+    for k in candidate_ks:
         km = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10)
-        labels = km.fit_predict(X_scaled)
-        score = silhouette_score(X_scaled, labels, sample_size=min(5000, len(X_scaled)))
-        log.info(f"  k={k} → silhouette={score:.4f}")
+        labels_tmp = km.fit_predict(shap_attacks)
+        score = silhouette_score(shap_attacks, labels_tmp,
+                                 sample_size=sil_sample,
+                                 random_state=RANDOM_STATE)
+        log.info(f"[STEP 10]   k={k}  →  silhouette = {score:.4f}")
         if score > best_score:
             best_score = score
             best_k = k
 
-    log.info(f"  Best k={best_k} (silhouette={best_score:.4f})")
+    log.info(f"[STEP 10]   ★ Winner: k={best_k}  (silhouette = {best_score:.4f})")
 
-    # Final clustering
+    # Final clustering with the best k
     km_final = KMeans(n_clusters=best_k, random_state=RANDOM_STATE, n_init=10)
-    cluster_labels = km_final.fit_predict(X_scaled)
+    cluster_labels = km_final.fit_predict(shap_attacks)
+    X_attacks["cluster"] = cluster_labels
 
-    # PCA for visualization
+    # ── Step C — Statistical deviation per cluster ───────────────────────────
+    log.info("[STEP 10] Step C — Statistical deviation analysis …")
+
+    global_mean = X_attacks[feature_names].mean()
+    cluster_means = X_attacks.groupby("cluster")[feature_names].mean()
+    deviation = cluster_means.subtract(global_mean, axis=1)
+
+    # Top 3 sensors by absolute deviation for each cluster
+    top_stat_sensors = {}   # {cluster_id: [sensor1, sensor2, sensor3]}
+    for c in range(best_k):
+        top3 = deviation.loc[c].abs().nlargest(3).index.tolist()
+        top_stat_sensors[c] = top3
+        log.info(f"[STEP 10]   Cluster {c} — top stat-deviation sensors: {top3}")
+
+    # ── Step D — SHAP consistency per cluster ────────────────────────────────
+    log.info("[STEP 10] Step D — SHAP consistency analysis …")
+
+    # Merge cluster labels into shap_local_df on timestamp
+    shap_local_merged = shap_local_df.copy()
+    # Build a timestamp → cluster mapping from X_attacks
+    cluster_map_df = pd.DataFrame({
+        "timestamp": attack_indices,
+        "cluster":   cluster_labels,
+    })
+    shap_local_merged = shap_local_merged.merge(
+        cluster_map_df,
+        on="timestamp",
+        how="inner",
+    )
+
+    top_shap_sensors = {}   # {cluster_id: [sensor1, sensor2, sensor3]}
+    for c in range(best_k):
+        cdf = shap_local_merged[shap_local_merged["cluster"] == c]
+        if cdf.empty:
+            top_shap_sensors[c] = []
+            continue
+        # Collect all feature names across feature_1, feature_2, feature_3
+        sensor_counts = Counter()
+        for col in ["feature_1", "feature_2", "feature_3"]:
+            if col in cdf.columns:
+                sensor_counts.update(cdf[col].dropna().tolist())
+        top3 = [s for s, _ in sensor_counts.most_common(3)]
+        top_shap_sensors[c] = top3
+        log.info(f"[STEP 10]   Cluster {c} — top SHAP sensors: {top3}")
+
+    # ── Step E — Auto-generate cluster labels ────────────────────────────────
+    log.info("[STEP 10] Step E — Auto-generating cluster labels …")
+
+    cluster_labels_map = {}
+    agreement_flags = {}
+    for c in range(best_k):
+        stat_top = top_stat_sensors[c][0] if top_stat_sensors[c] else "Unknown"
+        shap_top = top_shap_sensors[c][0] if top_shap_sensors[c] else "Unknown"
+        if stat_top == shap_top:
+            label = f"{stat_top}-dominant attack"
+            agreement_flags[c] = True
+        else:
+            label = "Mixed disturbance (C/D conflict)"
+            agreement_flags[c] = False
+        cluster_labels_map[c] = label
+        log.info(f"[STEP 10]   Cluster {c}: stat_top={stat_top}, shap_top={shap_top} → \"{label}\"")
+
+    # ── Step F — Validate clusters ───────────────────────────────────────────
+    log.info("[STEP 10] Step F — Cluster validation …")
+
+    total_attacks = len(X_attacks)
+    log.info(f"[STEP 10]   Overall silhouette score: {best_score:.4f}")
+
+    for c in range(best_k):
+        n_c = int((X_attacks["cluster"] == c).sum())
+        pct = 100.0 * n_c / total_attacks
+        size_flag = " ⚠ POTENTIALLY WEAK (<5%)" if pct < 5.0 else ""
+        log.info(f"[STEP 10]   Cluster {c}: {n_c:,} instances ({pct:.1f}%){size_flag}")
+
+        # SHAP consistency check: does the top feature appear in ≥40% of members?
+        cdf = shap_local_merged[shap_local_merged["cluster"] == c]
+        if not cdf.empty and top_shap_sensors[c]:
+            top_feat = top_shap_sensors[c][0]
+            appearances = sum(
+                (cdf[col] == top_feat).sum()
+                for col in ["feature_1", "feature_2", "feature_3"]
+                if col in cdf.columns
+            )
+            consistency_pct = 100.0 * appearances / len(cdf)
+            if consistency_pct < 40.0:
+                log.warning(f"[STEP 10]   Cluster {c}: LOW SHAP consistency — "
+                            f"'{top_feat}' appears in only {consistency_pct:.1f}% of members (<40%)")
+            else:
+                log.info(f"[STEP 10]   Cluster {c}: SHAP consistency OK — "
+                         f"'{top_feat}' appears in {consistency_pct:.1f}% of members")
+
+    # ── Step G — PCA visualization ───────────────────────────────────────────
+    log.info("[STEP 10] Step G — PCA visualization …")
+
     pca = PCA(n_components=2, random_state=RANDOM_STATE)
-    coords = pca.fit_transform(X_scaled)
-    log.info(f"  PCA explained variance: PC1={pca.explained_variance_ratio_[0]:.2%}, "
+    coords = pca.fit_transform(shap_attacks)
+    log.info(f"[STEP 10]   PCA explained variance: "
+             f"PC1={pca.explained_variance_ratio_[0]:.2%}, "
              f"PC2={pca.explained_variance_ratio_[1]:.2%}")
 
-    # Save cluster assignments
-    cluster_df = pd.DataFrame({
-        "timestamp": X_attacks.index,
-        "cluster": cluster_labels,
-        "pca_1": coords[:, 0],
-        "pca_2": coords[:, 1],
-    })
-    cluster_path = os.path.join(OUTPUT_DIR, "attack_clusters.csv")
-    cluster_df.to_csv(cluster_path, index=False)
-    log.info(f"  Cluster assignments saved → {cluster_path}")
+    # Colorblind-friendly palette (Wong 2011)
+    cb_palette = ["#0072B2", "#E69F00", "#009E73", "#CC79A7",
+                  "#56B4E9", "#D55E00", "#F0E442", "#000000"]
 
-    # Log cluster sizes
+    fig, ax = plt.subplots(figsize=(11, 8))
     for c in range(best_k):
-        n = (cluster_labels == c).sum()
-        log.info(f"    Cluster {c}: {n:,} instances ({100*n/len(cluster_labels):.1f}%)")
+        mask = X_attacks["cluster"].values == c
+        color = cb_palette[c % len(cb_palette)]
+        ax.scatter(coords[mask, 0], coords[mask, 1],
+                   c=color, label=f"Cluster {c}: {cluster_labels_map[c]}",
+                   alpha=0.55, s=18, edgecolors="none")
+        # Annotate centroid
+        cx, cy = coords[mask, 0].mean(), coords[mask, 1].mean()
+        ax.annotate(cluster_labels_map[c], (cx, cy),
+                    fontsize=8, fontweight="bold", color=color,
+                    ha="center", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=color, alpha=0.8))
 
-    # PCA scatter plot
-    fig, ax = plt.subplots(figsize=(10, 7))
-    cmap = plt.cm.get_cmap("Set2", best_k)
-    for c in range(best_k):
-        mask = cluster_labels == c
-        ax.scatter(coords[mask, 0], coords[mask, 1], c=[cmap(c)],
-                   label=f"Cluster {c} (n={mask.sum():,})", alpha=0.6, s=15)
     ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)", fontsize=12)
     ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)", fontsize=12)
-    ax.set_title("Attack Pattern Clusters (KMeans + PCA)\nSWaT Cyber-Physical Attack Taxonomy",
-                 fontsize=13)
-    ax.legend(fontsize=10)
+    ax.set_title("SHAP-based Attack Pattern Clusters (KMeans + PCA)\n"
+                 "SWaT Cyber-Physical Attack Taxonomy", fontsize=13)
+    ax.legend(fontsize=9, loc="best", framealpha=0.9)
     plt.tight_layout()
-    pca_path = os.path.join(OUTPUT_DIR, "attack_clusters_pca.png")
+    pca_path = os.path.join(OUTPUT_DIR, "shap_attack_clusters.png")
     fig.savefig(pca_path, dpi=150)
     plt.close(fig)
-    log.info(f"  PCA scatter plot saved → {pca_path}")
+    log.info(f"[STEP 10]   PCA scatter plot saved → {pca_path}")
 
-    return cluster_df
+    # ── Step H — Final summary CSV ───────────────────────────────────────────
+    log.info("[STEP 10] Step H — Building cluster summary …")
+
+    summary_rows = []
+    for c in range(best_k):
+        n_c = int((X_attacks["cluster"] == c).sum())
+        pct = round(100.0 * n_c / total_attacks, 2)
+        stat_top = top_stat_sensors[c][0] if top_stat_sensors[c] else "N/A"
+        shap_top = top_shap_sensors[c][0] if top_shap_sensors[c] else "N/A"
+        summary_rows.append({
+            "cluster":          c,
+            "size":             n_c,
+            "pct_of_attacks":   pct,
+            "top_stat_sensor":  stat_top,
+            "top_shap_sensor":  shap_top,
+            "agreement":        agreement_flags[c],
+            "label":            cluster_labels_map[c],
+            "silhouette_score": round(best_score, 4),
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_path = os.path.join(OUTPUT_DIR, "attack_cluster_summary.csv")
+    summary_df.to_csv(summary_path, index=False)
+    log.info(f"[STEP 10]   Cluster summary saved → {summary_path}")
+    log.info(f"[STEP 10]   Summary:\n{summary_df.to_string(index=False)}")
+
+    log.info("[STEP 10] Attack clustering complete.")
+    return X_attacks, cluster_labels_map
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -805,14 +968,17 @@ def main():
     # Step 9: Threat Reasoning (local explanations)
     local_df = threat_reasoning(shap_values, X_shap, predictions_df)
 
-    # Step 10: LIME Explainability (uses X_train as background — no leakage)
+    # Step 10: Attack Clustering (KMeans on SHAP vectors)
+    feature_names = list(X_test.columns)
+    cluster_df, cluster_labels_map = run_attack_clustering(
+        X_test, y_test, shap_values, feature_names, predictions_df, local_df
+    )
+
+    # Step 11: LIME Explainability (uses X_train as background — no leakage)
     lime_local_df, lime_summary = explain_lime(model, X_train, X_test, predictions_df)
 
-    # Step 11: SHAP vs LIME Agreement
+    # Step 12: SHAP vs LIME Agreement
     agreement = compute_agreement(local_df, lime_local_df)
-
-    # Step 12: Attack Clustering
-    cluster_df = cluster_attacks(X_test, predictions_df)
 
     # Final Summary
     log.info("=" * 70)
@@ -829,12 +995,12 @@ def main():
         "predictions.csv",
         "shap_summary.csv",
         "shap_local_explanations.csv",
+        "attack_cluster_summary.csv",
+        "shap_attack_clusters.png",
         "lime_local_explanations.csv",
         "lime_summary.csv",
         "xai_agreement.csv",
         "xai_agreement_summary.txt",
-        "attack_clusters.csv",
-        "attack_clusters_pca.png",
         "confusion_matrix.png",
         "shap_global_bar.png",
         "shap_beeswarm.png",
