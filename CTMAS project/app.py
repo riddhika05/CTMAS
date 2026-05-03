@@ -329,9 +329,12 @@ def main():
                         """
 
                     # Pulse-red alert card with attack type card
+                    stride_label = c_info["stride"] if c_info else ""
+                    stride_line = f'<p style="margin:6px 0 0 0;font-size:1.35em;color:#ff6b6b;letter-spacing:0.03em"><b>⚡ {stride_label}</b></p>' if stride_label else ""
                     status_placeholder.markdown(
                         f'<div class="attack-alert-v2">'
                         f'<h2>🚨 CYBER-PHYSICAL ATTACK DETECTED</h2>'
+                        f'{stride_line}'
                         f'<p>Timestamp: {timestamp} · Threat Prob: {prob:.4f}</p>'
                         f'{attack_type_html}</div>',
                         unsafe_allow_html=True,
