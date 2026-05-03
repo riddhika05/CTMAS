@@ -1,6 +1,6 @@
 # Explainable AI–Based Threat Modeling for Trustworthy Cyber–Physical Systems under Intelligent Adversaries
 
-**CTMAS (Cyber-Physical Threat Monitoring & Analysis System)** is a comprehensive framework designed to detect, explain, and categorize cyber-physical attacks in real-time. This project focuses on enhancing the **trustworthiness** of anomaly detection systems by providing multi-modal explanations and automated threat taxonomy, specifically tailored for critical infrastructure like the **Secure Water Treatment (SWaT)** plant.
+**XAI-Guard (Explainable Threat Modeling for Cyber-Physical Systems)** is a comprehensive framework designed to detect, explain, and categorize cyber-physical attacks in real-time. This project focuses on enhancing the **trustworthiness** of anomaly detection systems by providing multi-modal explanations and automated threat taxonomy, specifically tailored for critical infrastructure like the **Secure Water Treatment (SWaT)** plant.
 
 ---
 
@@ -23,7 +23,7 @@ In the SWaT dataset, attacks represent only ~3.8% of the total data. To prevent 
 - This forces XGBoost to penalize misclassifications of the minority (Attack) class 25 times more heavily than the majority class.
 
 ### 2. Decision Threshold Optimization (0.3)
-Unlike standard classifiers that use a 0.5 threshold, CTMAS uses a **0.3 threshold**:
+Unlike standard classifiers that use a 0.5 threshold, XAI-Guard uses a **0.3 threshold**:
 - **Rationale**: In critical infrastructure security, a **False Negative (missing an attack)** is far more dangerous than a False Positive.
 - By lowering the threshold, we significantly boost **Recall (Detection Rate)**, ensuring that even low-probability threat signals are flagged for human review.
 

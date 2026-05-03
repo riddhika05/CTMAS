@@ -1,5 +1,5 @@
 """
-CTMAS: Cyber-Physical Systems Threat Monitoring & Analysis System
+XAI-Guard: Explainable Threat Modeling for Cyber-Physical Systems
 ================================================================
 XGBoost + SHAP Explainable AI Pipeline for SWaT Dataset Security.
 
@@ -16,6 +16,7 @@ Pipeline Steps:
 """
 
 import os
+import json
 import sys
 import warnings
 import logging
@@ -824,16 +825,56 @@ def run_attack_clustering(
     cluster_labels_map = {}
     agreement_flags = {}
     for c in range(best_k):
-        stat_top = top_stat_sensors[c][0] if top_stat_sensors[c] else "Unknown"
         shap_top = top_shap_sensors[c][0] if top_shap_sensors[c] else "Unknown"
+        stat_top = top_stat_sensors[c][0] if top_stat_sensors[c] else "Unknown"
         if stat_top == shap_top:
-            label = f"{stat_top}-dominant attack"
+            label = f"{shap_top}-dominant attack"
             agreement_flags[c] = True
         else:
-            label = "Mixed disturbance (C/D conflict)"
+            # SHAP wins: it identifies root cause; stats identifies downstream effect
+            label = f"{shap_top}-driven attack (stat: {stat_top})"
             agreement_flags[c] = False
         cluster_labels_map[c] = label
-        log.info(f"[STEP 10]   Cluster {c}: stat_top={stat_top}, shap_top={shap_top} → \"{label}\"")
+        log.info(f"[STEP 10]   Cluster {c}: shap_top={shap_top}, stat_top={stat_top}, "
+                 f"agreement={agreement_flags[c]} → \"{label}\"")
+    log.info("[STEP 10]   NOTE: SHAP is used as primary label source. "
+             "Statistical sensor identifies downstream effect; SHAP identifies root cause.")
+
+    # ── Step E2 — STRIDE and MITRE ATT&CK ICS mapping ────────────────────────
+    log.info("[STEP 10] Step E2 — STRIDE / MITRE ATT&CK ICS mapping …")
+
+    def map_to_frameworks(label: str) -> dict:
+        """Map a cluster label string to STRIDE and MITRE ATT&CK ICS categories."""
+        label_upper = label.upper()
+        if "AIT" in label_upper:
+            return {"stride": "Tampering",
+                    "mitre_ics": "T0836 - Modify Parameter"}
+        if "FIT" in label_upper:
+            return {"stride": "Denial of Service",
+                    "mitre_ics": "T0813 - Denial of Control"}
+        if "LIT" in label_upper:
+            return {"stride": "Spoofing",
+                    "mitre_ics": "T0856 - Spoof Reporting Message"}
+        if "MV" in label_upper:
+            return {"stride": "Tampering",
+                    "mitre_ics": "T0831 - Manipulate Process Control"}
+        # Pump sensors: P1xx, P2xx, P3xx, P4xx, P6xx
+        if any(f"P{d}" in label_upper for d in ("1", "2", "3", "4", "6")):
+            return {"stride": "Denial of Service",
+                    "mitre_ics": "T0813 - Denial of Control"}
+        if "MIXED" in label_upper:
+            return {"stride": "Tampering",
+                    "mitre_ics": "T0836 - Modify Parameter"}
+        # Default fallback
+        return {"stride": "Tampering",
+                "mitre_ics": "T0831 - Manipulate Process Control"}
+
+    cluster_framework_map = {}
+    for c, lbl in cluster_labels_map.items():
+        fw = map_to_frameworks(lbl)
+        cluster_framework_map[c] = fw
+        log.info(f"[STEP 10]   Cluster {c} (\"{lbl}\") → "
+                 f"STRIDE={fw['stride']}, MITRE={fw['mitre_ics']}")
 
     # ── Step F — Validate clusters ───────────────────────────────────────────
     log.info("[STEP 10] Step F — Cluster validation …")
@@ -923,10 +964,46 @@ def run_attack_clustering(
         })
 
     summary_df = pd.DataFrame(summary_rows)
+
+    # ── Step E2 (cont.) — Add STRIDE / MITRE columns to summary_df ───────────
+    summary_df["stride_category"] = summary_df["cluster"].map(
+        lambda c: cluster_framework_map[c]["stride"]
+    )
+    summary_df["mitre_ics_ttp"] = summary_df["cluster"].map(
+        lambda c: cluster_framework_map[c]["mitre_ics"]
+    )
+
     summary_path = os.path.join(OUTPUT_DIR, "attack_cluster_summary.csv")
     summary_df.to_csv(summary_path, index=False)
     log.info(f"[STEP 10]   Cluster summary saved → {summary_path}")
     log.info(f"[STEP 10]   Summary:\n{summary_df.to_string(index=False)}")
+
+    # ── Step E3 — Save centroids and label map for live dashboard ─────────────
+    log.info("[STEP 10] Step E3 — Saving centroids, label map & framework map …")
+
+    centroids_path = os.path.join(OUTPUT_DIR, "cluster_centroids.npy")
+    np.save(centroids_path, km_final.cluster_centers_)
+    log.info(f"[STEP 10]   Cluster centroids saved → {centroids_path}")
+
+    labels_map_path = os.path.join(OUTPUT_DIR, "cluster_labels_map.json")
+    with open(labels_map_path, "w", encoding="utf-8") as f:
+        json.dump({str(k): v for k, v in cluster_labels_map.items()}, f, indent=2)
+    log.info(f"[STEP 10]   Cluster labels map saved → {labels_map_path}")
+
+    # Build full framework map: cluster_id → label + sensors + stride + mitre
+    framework_export = {}
+    for c in range(best_k):
+        framework_export[str(c)] = {
+            "label":       cluster_labels_map[c],
+            "shap_sensor": top_shap_sensors[c][0] if top_shap_sensors[c] else "Unknown",
+            "stat_sensor": top_stat_sensors[c][0] if top_stat_sensors[c] else "Unknown",
+            "stride":      summary_df.loc[summary_df["cluster"] == c, "stride_category"].values[0],
+            "mitre":       summary_df.loc[summary_df["cluster"] == c, "mitre_ics_ttp"].values[0],
+        }
+    framework_map_path = os.path.join(OUTPUT_DIR, "cluster_framework_map.json")
+    with open(framework_map_path, "w", encoding="utf-8") as f:
+        json.dump(framework_export, f, indent=2)
+    log.info(f"[STEP 10]   Framework map saved → {framework_map_path}")
 
     log.info("[STEP 10] Attack clustering complete.")
     return X_attacks, cluster_labels_map
@@ -937,7 +1014,7 @@ def run_attack_clustering(
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 70)
-    log.info("  CTMAS - CPS Threat Monitoring & Analysis System")
+    log.info("  XAI-Guard - Explainable Threat Modeling for Cyber-Physical Systems")
     log.info("  XGBoost + SHAP + LIME Explainable AI Pipeline  |  SWaT Dataset")
     log.info("=" * 70)
 
@@ -996,6 +1073,9 @@ def main():
         "shap_summary.csv",
         "shap_local_explanations.csv",
         "attack_cluster_summary.csv",
+        "cluster_centroids.npy",
+        "cluster_labels_map.json",
+        "cluster_framework_map.json",
         "shap_attack_clusters.png",
         "lime_local_explanations.csv",
         "lime_summary.csv",

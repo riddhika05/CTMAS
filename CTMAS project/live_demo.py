@@ -23,7 +23,7 @@ def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
 def load_system():
-    print(f"{YELLOW}Initializing CTMAS Live Threat Detection System...{RESET}")
+    print(f"{YELLOW}Initializing XAI-Guard Live Threat Detection System...{RESET}")
 
     # Load model
     model_path = "outputs/xgboost_model.json"
@@ -62,7 +62,7 @@ def load_system():
 def run_live_demo(model, shap_explainer, lime_explainer, normal_df, attack_df):
     clear_screen()
     print("=" * 70)
-    print(f"{BOLD}CTMAS LIVE DASHBOARD - SECURE WATER TREATMENT MONITORING{RESET}")
+    print(f"{BOLD}XAI-GUARD LIVE DASHBOARD - SECURE WATER TREATMENT MONITORING{RESET}")
     print(f"{BOLD}Dual XAI Engine: SHAP + LIME{RESET}")
     print("=" * 70)
     print("Streaming live sensor data from CPS network...")

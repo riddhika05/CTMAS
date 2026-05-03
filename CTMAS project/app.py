@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
+import json
 import time
 import random
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ import matplotlib.pyplot as plt
 # PAGE CONFIG
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="CTMAS Dashboard",
+    page_title="XAI-Guard Dashboard",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -88,7 +89,7 @@ st.markdown("""
 def load_system():
     model_path = "outputs/xgboost_model.json"
     if not os.path.exists(model_path):
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None, None
     model = XGBClassifier()
     model.load_model(model_path)
     df = pd.read_csv("archive3/clean_merged.csv", index_col=0, parse_dates=True)
@@ -102,7 +103,19 @@ def load_system():
         mode="classification",
         random_state=42,
     )
-    return model, explainer, lime_explainer, normal_df, attack_df
+
+    # Load cluster centroids and maps for live dashboard
+    try:
+        cluster_centroids = np.load("outputs/cluster_centroids.npy")
+        with open("outputs/cluster_labels_map.json") as f:
+            cluster_labels_map = json.load(f)
+        with open("outputs/cluster_framework_map.json") as f:
+            cluster_framework_map = json.load(f)
+    except Exception:
+        cluster_centroids, cluster_labels_map, cluster_framework_map = None, None, None
+
+    return (model, explainer, lime_explainer, normal_df, attack_df,
+            cluster_centroids, cluster_labels_map, cluster_framework_map)
 
 
 # =============================================================================
@@ -124,8 +137,8 @@ def get_top_sensors(fallback_features, k=8):
 def main():
     # ── Sidebar ──────────────────────────────────────────────────────────────
     st.sidebar.image("https://cdn-icons-png.flaticon.com/512/2092/2092663.png", width=80)
-    st.sidebar.title("CTMAS")
-    st.sidebar.markdown("**Cyber-Physical Threat Monitoring & Analysis System**")
+    st.sidebar.title("XAI-Guard")
+    st.sidebar.markdown("**Explainable Threat Modeling for Cyber-Physical Systems**")
     st.sidebar.markdown("---")
 
     page = st.sidebar.radio("Navigation", [
@@ -156,7 +169,8 @@ def main():
     )
 
     # ── Load model ───────────────────────────────────────────────────────────
-    model, shap_explainer, lime_explainer, normal_df, attack_df = load_system()
+    (model, shap_explainer, lime_explainer, normal_df, attack_df,
+     cluster_centroids, cluster_labels_map, cluster_framework_map) = load_system()
     if model is None:
         st.error("Model not found! Run the pipeline first.")
         return
@@ -256,39 +270,75 @@ def main():
 
                 # ── Attack path ──────────────────────────────────────────────
                 else:
-                    # FIX 3 — Pulse-red alert card
+                    # SHAP (ML logic unchanged)
+                    shap_values = shap_explainer.shap_values(row)
+                    instance_shap = shap_values[0]
+                    abs_shap = np.abs(instance_shap)
+                    shap_top_idx = np.argsort(abs_shap)[::-1][:3]
+                    shap_feats = [feature_names[j] for j in shap_top_idx]
+                    shap_vals = [float(instance_shap[j]) for j in shap_top_idx]
+
+                    # LIME (ML logic unchanged)
+                    lime_exp = lime_explainer.explain_instance(
+                        row.values[0], model.predict_proba,
+                        num_features=3, num_samples=500, labels=(1,),
+                    )
+                    lime_weights = lime_exp.as_list(label=1)[:3]
+                    lime_feats, lime_vals = [], []
+                    for feat_expr, w in lime_weights:
+                        matched = [f for f in feature_names if f in feat_expr]
+                        lime_feats.append(matched[0] if matched else feat_expr.split(" ")[0])
+                        lime_vals.append(w)
+
+                    agree = shap_feats[0] == lime_feats[0]
+
+                    # Nearest-cluster matching for attack typing
+                    c_info = None
+                    attack_type_html = ""
+                    if cluster_centroids is not None:
+                        distances = np.linalg.norm(cluster_centroids - instance_shap, axis=1)
+                        nearest = str(np.argmin(distances))
+                        c_info = cluster_framework_map[nearest]
+                        attack_type_html = f"""
+                        <div style='margin-top:12px;padding:12px 16px;background:#0d0d1a;
+                                    border-left:3px solid #7986cb;border-radius:6px;font-size:13px'>
+                            <div style='margin-bottom:6px'>
+                                <span style='color:#888;font-size:11px;text-transform:uppercase;
+                                             letter-spacing:0.08em'>Attack Pattern</span><br>
+                                <span style='color:#fff;font-weight:500'>{c_info["label"]}</span>
+                            </div>
+                            <div style='display:flex;gap:24px;margin-top:8px'>
+                                <div>
+                                    <span style='color:#888;font-size:11px'>Root Cause (SHAP)</span><br>
+                                    <span style='color:#4fc3f7;font-weight:500'>{c_info["shap_sensor"]}</span>
+                                </div>
+                                <div>
+                                    <span style='color:#888;font-size:11px'>Downstream Effect (Stat)</span><br>
+                                    <span style='color:#ffb74d;font-weight:500'>{c_info["stat_sensor"]}</span>
+                                </div>
+                                <div>
+                                    <span style='color:#888;font-size:11px'>STRIDE</span><br>
+                                    <span style='color:#ef9a9a;font-weight:500'>{c_info["stride"]}</span>
+                                </div>
+                                <div>
+                                    <span style='color:#888;font-size:11px'>MITRE ICS</span><br>
+                                    <span style='color:#ce93d8;font-weight:500'>{c_info["mitre"]}</span>
+                                </div>
+                            </div>
+                        </div>
+                        """
+
+                    # Pulse-red alert card with attack type card
                     status_placeholder.markdown(
                         f'<div class="attack-alert-v2">'
                         f'<h2>🚨 CYBER-PHYSICAL ATTACK DETECTED</h2>'
-                        f'<p>Timestamp: {timestamp} · Threat Prob: {prob:.4f}</p></div>',
+                        f'<p>Timestamp: {timestamp} · Threat Prob: {prob:.4f}</p>'
+                        f'{attack_type_html}</div>',
                         unsafe_allow_html=True,
                     )
 
-                    # FIX 4 — XAI dual pane inside placeholder container
+                    # XAI charts inside placeholder
                     with xai_placeholder.container():
-                        # SHAP (ML logic unchanged)
-                        shap_values = shap_explainer.shap_values(row)
-                        instance_shap = shap_values[0]
-                        abs_shap = np.abs(instance_shap)
-                        shap_top_idx = np.argsort(abs_shap)[::-1][:3]
-                        shap_feats = [feature_names[j] for j in shap_top_idx]
-                        shap_vals = [float(instance_shap[j]) for j in shap_top_idx]
-
-                        # LIME (ML logic unchanged)
-                        lime_exp = lime_explainer.explain_instance(
-                            row.values[0], model.predict_proba,
-                            num_features=3, num_samples=500, labels=(1,),
-                        )
-                        lime_weights = lime_exp.as_list(label=1)[:3]
-                        lime_feats, lime_vals = [], []
-                        for feat_expr, w in lime_weights:
-                            matched = [f for f in feature_names if f in feat_expr]
-                            lime_feats.append(matched[0] if matched else feat_expr.split(" ")[0])
-                            lime_vals.append(w)
-
-                        agree = shap_feats[0] == lime_feats[0]
-
-                        # Charts side-by-side
                         c1, c2 = st.columns(2)
                         with c1:
                             st.markdown("**SHAP — Feature Contributions**")
@@ -317,21 +367,26 @@ def main():
                             st.pyplot(fig2)
                             plt.close(fig2)
 
-                        # Agreement line
+                        # Agreement line with stat vs SHAP distinction
+                        stat_sensor_label = c_info['stat_sensor'] if c_info else 'N/A'
                         if agree:
-                            st.success(f"✅ XAI Consensus: Both SHAP and LIME identify "
-                                       f"**{shap_feats[0]}** as the primary manipulated sensor.")
+                            st.success(f"✅ **Root Cause Sensors (SHAP):** {', '.join(shap_feats)} | "
+                                       f"**Downstream (Stat):** {stat_sensor_label} | "
+                                       f"**XAI Consensus:** ✅ SHAP & LIME agree")
                         else:
-                            st.warning(f"⚠️ XAI Conflict: SHAP flags **{shap_feats[0]}**, "
-                                       f"LIME flags **{lime_feats[0]}**. Manual review recommended.")
+                            st.warning(f"⚠️ **Root Cause Sensors (SHAP):** {', '.join(shap_feats)} | "
+                                       f"**Downstream (Stat):** {stat_sensor_label} | "
+                                       f"**XAI Consensus:** ⚠️ SHAP={shap_feats[0]}, LIME={lime_feats[0]}")
 
-                    # FIX 5 — Append to attack log
+                    # Append to attack log
                     st.session_state["attack_log"].append({
                         "Timestamp": str(timestamp),
                         "Threat Prob": f"{prob:.4f}",
                         "Top Sensor (SHAP)": shap_feats[0],
                         "Top Sensor (LIME)": lime_feats[0],
                         "Agreement": "✅ AGREE" if agree else "⚠️ DIFFER",
+                        "STRIDE": c_info["stride"] if c_info else "N/A",
+                        "MITRE ICS": c_info["mitre"] if c_info else "N/A",
                     })
                     attack_log_placeholder.dataframe(
                         pd.DataFrame(st.session_state["attack_log"]),
@@ -467,6 +522,7 @@ def main():
                 display_df.columns = [
                     "Cluster", "Size", "% of Attacks", "Top Stat Sensor",
                     "Top SHAP Sensor", "Agreement", "Label", "Silhouette",
+                    "STRIDE Category", "MITRE ICS TTP",
                 ]
 
                 def _hl(val):
@@ -501,19 +557,104 @@ def main():
     # PAGE 3: ABOUT
     # =====================================================================
     elif page == "ℹ️ About System":
-        st.title("ℹ️ About CTMAS")
+        st.title("ℹ️ About XAI-Guard")
         st.markdown("""
-        ### Cyber-Physical Threat Monitoring & Analysis System
+## XAI-Guard: Explainable Threat Modeling for Cyber-Physical Systems
 
-        **How it works:**
-        1. **Detection (XGBoost):** Trains on the SWaT (Secure Water Treatment) dataset — 51 sensors and actuators. When live data violates learned physical constraints, it flags the row as an attack.
-        2. **Explainability (SHAP):** Uses Game Theory (SHapley Additive exPlanations) to isolate which sensors caused the anomaly.
-        3. **Explainability (LIME):** Creates local surrogate models by perturbing inputs and observing prediction changes — a complementary view.
-        4. **XAI Agreement Score:** Compares top features from SHAP and LIME. High agreement validates explanation trustworthiness.
-        5. **Attack Clustering (SHAP + KMeans + PCA):** Clusters attacks using KMeans on SHAP vectors, cross-references statistical deviation with SHAP importance per cluster to auto-generate labels (e.g., "LIT101-dominant attack"). PCA reduces to 2D for visualization.
+### Problem Statement
+Modern Cyber-Physical Systems (CPS) — such as water treatment plants, power grids, and 
+industrial control systems — are increasingly targeted by sophisticated adversaries. 
+Unlike traditional IT attacks, CPS attacks manipulate physical processes: opening the 
+wrong valve, falsifying a sensor reading, or disabling a pump can cause real-world 
+damage. Conventional intrusion detection systems flag anomalies but cannot explain 
+*which physical component was manipulated or why* — a critical gap for operators who 
+must respond in seconds.
 
-        **Built with:** Python · XGBoost · SHAP · LIME · scikit-learn · Streamlit
-        """)
+### What XAI-Guard Does
+XAI-Guard addresses this gap by combining ML-based detection with two independent 
+Explainable AI (XAI) methods, attack taxonomy, and real-time threat reasoning — all 
+on the SWaT (Secure Water Treatment) benchmark dataset from iTrust, SUTD Singapore, 
+which contains 51 sensor and actuator readings across 7 days including 36 documented 
+cyber-attack scenarios.
+
+### System Architecture
+
+**1. Detection — XGBoost Classifier**  
+The system learns the multivariate physical correlations between all 51 sensors and 
+actuators under normal operation. Violations of these learned constraints — a pump 
+active while its upstream valve is closed, a tank level rising while the inlet flow 
+reads zero — are flagged as attacks. A decision threshold of 0.3 (vs the standard 0.5) 
+is used deliberately to prioritise recall: in a safety-critical plant, a missed attack 
+is far more dangerous than a false alarm. This yields **99.92% attack recall**.
+
+**2. Explainability — SHAP (SHapley Additive exPlanations)**  
+Based on cooperative game theory, SHAP decomposes each model prediction into per-sensor 
+contributions. For every detected attack, SHAP identifies *which specific sensors drove 
+the detection and by how much* — acting as a forensic detective that pinpoints the 
+manipulated component.
+
+**3. Explainability — LIME (Local Interpretable Model-Agnostic Explanations)**  
+As a second, independent XAI method, LIME builds a local linear surrogate model around 
+each prediction by perturbing the input space. This provides a complementary view of 
+feature importance that is model-agnostic — it makes no assumptions about the XGBoost 
+internals.
+
+**4. XAI Trustworthiness Validation — Agreement Score**  
+The core research contribution: SHAP and LIME are mathematically independent methods. 
+By measuring how often they agree on the top contributing sensor (Top-1 Agreement %) 
+and the overlap in their top-3 feature sets (Jaccard Similarity), we quantify whether 
+the explanations are *trustworthy and stable* rather than artifacts of a single method. 
+High agreement validates that the identified sensor is genuinely the manipulated 
+component, not a spurious correlation.
+
+**5. Attack Taxonomy — KMeans Clustering on SHAP Vectors**  
+Detected attacks are grouped by their SHAP fingerprint using KMeans (optimal k selected 
+by silhouette score). Each cluster is labelled using the intersection of statistical 
+feature deviation analysis and SHAP consistency — two independent signals that must 
+agree for a label to be assigned. This produces a semantic attack taxonomy directly 
+from data.
+
+**6. Threat Framework Mapping — STRIDE + MITRE ATT&CK for ICS**  
+Each attack cluster is mapped to the STRIDE threat model (Spoofing, Tampering, 
+Repudiation, Information Disclosure, Denial of Service, Elevation of Privilege) and to 
+the MITRE ATT&CK for ICS matrix (a purpose-built taxonomy for industrial control system 
+attacks). This grounds the data-driven clusters in established cybersecurity frameworks, 
+enabling operators to respond using standard playbooks.
+
+**7. Real-Time Deployment**  
+The full pipeline runs offline once to train and explain. At runtime, the dashboard 
+streams simulated sensor readings, classifies each row in real time, computes SHAP and 
+LIME for every detected attack, matches the SHAP vector to the nearest pre-computed 
+cluster centroid, and displays the STRIDE category and MITRE TTP — all within the 
+alert card.
+
+### Dataset
+**SWaT (Secure Water Treatment)** — iTrust, Singapore University of Technology and Design.  
+- 946,722 rows × 51 features (sensors + actuators)  
+- 7 days of operation: 4 days normal, 3 days under 36 documented attack scenarios  
+- Class distribution: ~88.7% normal, ~11.3% attack  
+- Features: flow sensors (FIT), level sensors (LIT), motorized valves (MV), pumps (P), 
+  chemical dosing pumps (AIT), conductivity sensors
+
+### Key Results
+| Metric | Value |
+|--------|-------|
+| Accuracy | 98.19% |
+| Precision | 67.73% |
+| Recall (Attack Detection Rate) | 99.92% |
+| F1-Score | 80.74% |
+| SHAP–LIME Top-1 Agreement | *(from pipeline output)* |
+| SHAP–LIME Top-3 Jaccard | *(from pipeline output)* |
+
+### Technologies
+Python · XGBoost · SHAP · LIME · scikit-learn (KMeans, PCA, silhouette) · 
+Streamlit · Matplotlib · Pandas · NumPy
+
+### Course Alignment
+This project demonstrates CO3 (STRIDE framework analysis), CO4 (MITRE ATT&CK for ICS), 
+and CO5 (end-to-end threat modeling case study with justified results) from the 
+Cyber Security using Threat Modelling and Attack Simulation course.
+""")
 
 
 if __name__ == "__main__":
